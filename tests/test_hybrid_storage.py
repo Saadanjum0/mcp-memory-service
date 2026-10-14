@@ -334,6 +334,46 @@ class TestHybridMemoryStorage:
         assert "sync_status" in stats
 
     @pytest.mark.asyncio
+    async def test_get_stats_reports_http_secondary(self, temp_sqlite_db):
+        """A hybrid built on an HTTP secondary must not be labelled Cloudflare (#1482)."""
+        with patch('mcp_memory_service.storage.hybrid.RemoteHTTPStorage', MockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                secondary_backend='http',
+                secondary_url='https://hub.example.test',
+                secondary_api_key='test-key',
+                sync_interval=1,
+                batch_size=5
+            )
+            await storage.initialize()
+            try:
+                assert storage.secondary_backend_type == 'http'
+                stats = await storage.get_stats()
+                assert stats["storage_backend"] == "Hybrid (SQLite-vec + HTTP)"
+                assert stats["secondary_backend"] == "HTTP"
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_get_stats_without_secondary(self, temp_sqlite_db):
+        """Without any secondary get_stats must not name one (#1482).
+
+        `secondary_backend` is passed explicitly: left at None it falls back to
+        MCP_HYBRID_SECONDARY_BACKEND, so a developer's own hub settings would turn
+        this into an HTTP secondary (or a missing-URL error). 'cloudflare' with no
+        cloudflare_config is the SQLite-only path.
+        """
+        storage = HybridMemoryStorage(sqlite_db_path=temp_sqlite_db, secondary_backend='cloudflare')
+        await storage.initialize()
+        try:
+            assert storage.secondary_backend_type is None
+            stats = await storage.get_stats()
+            assert stats["storage_backend"] == "Hybrid (SQLite-vec, no secondary)"
+            assert stats["secondary_backend"] == "None"
+        finally:
+            await storage.close()
+
+    @pytest.mark.asyncio
     async def test_force_sync(self, hybrid_storage, sample_memory):
         """Test forcing immediate synchronization."""
         # Store some memories
@@ -708,6 +748,237 @@ class TestBackgroundSyncService:
                 assert storage.secondary.cursor_scan_calls == 0, (
                     "pull fell through to the paginated scan even though the exact "
                     "missing hashes were known"
+                )
+            finally:
+                await storage.close()
+
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_diffs_hashes_when_cloud_holds_more(self, temp_sqlite_db, mock_cloudflare_config):
+        """When the cloud holds MORE memories than the primary, the pull must still diff
+        hashes. It used to fall through to the newest-first scan, which gives up after
+        HYBRID_MAX_EMPTY_BATCHES batches without a new memory, so an old cloud-only
+        memory buried behind shared ones was never pulled."""
+
+        class PullMockCloudflareStorage(MockCloudflareStorage):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+                self.cursor_scan_calls = 0
+
+            async def get_by_hash(self, content_hash):
+                return self.stored_memories.get(content_hash)
+
+            async def _retry_request(self, method, url, **kwargs):
+                params = kwargs.get("json", {}).get("params", [])
+                last_id = params[0] if params else 0
+                resp = Mock()
+                rows = [
+                    {"id": i, "content_hash": m.content_hash}
+                    for i, m in enumerate(self.stored_memories.values(), start=1)
+                ] if last_id == 0 else []
+                resp.json = Mock(return_value={"success": True, "result": [{"results": rows}]})
+                return resp
+
+            async def get_all_memories_cursor(self, limit=100, cursor=None):
+                self.cursor_scan_calls += 1
+                return list(self.stored_memories.values()) if cursor is None else []
+
+        with patch('mcp_memory_service.storage.hybrid.CloudflareStorage', PullMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                old = time.time() - 100_000
+                shared = Memory(
+                    content="shared",
+                    content_hash=generate_content_hash("shared"),
+                    tags=["shared"],
+                    memory_type="note",
+                )
+                await storage.primary.store(shared)
+                storage.secondary.stored_memories[shared.content_hash] = shared
+
+                cloud_only = []
+                for content in ("cloud-only", "cloud-only-older"):
+                    memory = Memory(
+                        content=content,
+                        content_hash=generate_content_hash(content),
+                        tags=["cloud"],
+                        memory_type="note",
+                        created_at=old,
+                        updated_at=old,
+                    )
+                    storage.secondary.stored_memories[memory.content_hash] = memory
+                    cloud_only.append(memory)
+
+                # The cloud holds more than the primary: 3 vs 1.
+                assert (await storage.primary.get_stats())["total_memories"] == 1
+                assert (await storage.secondary.get_stats())["total_memories"] == 3
+
+                result = await storage.force_pull_sync()
+                assert result["success"] is True
+                assert result["memories_pulled"] == 2
+
+                local_hashes = await storage.primary.get_all_content_hashes()
+                for memory in cloud_only:
+                    assert memory.content_hash in local_hashes
+                assert storage.secondary.cursor_scan_calls == 0, (
+                    "pull fell through to the paginated scan even though the exact "
+                    "missing hashes were known"
+                )
+            finally:
+                await storage.close()
+
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_scans_when_the_cloud_hash_fetch_fails(self, temp_sqlite_db, mock_cloudflare_config):
+        """A failed D1 hash fetch must not read as "the cloud holds nothing": the pull
+        falls back to the paginated scan and still brings the missing memory down."""
+
+        class FailingHashMockCloudflareStorage(MockCloudflareStorage):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+                self.cursor_scan_calls = 0
+
+            async def _retry_request(self, method, url, **kwargs):
+                raise RuntimeError("D1 unavailable")
+
+            async def list_content_hashes(self, include_deleted=False):
+                # What the MemoryStorage default answers for a backend without a listing.
+                return set()
+
+            async def get_all_memories_cursor(self, limit=100, cursor=None):
+                self.cursor_scan_calls += 1
+                return list(self.stored_memories.values()) if cursor is None else []
+
+        with patch('mcp_memory_service.storage.hybrid.CloudflareStorage', FailingHashMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                shared = Memory(
+                    content="shared",
+                    content_hash=generate_content_hash("shared"),
+                    tags=["shared"],
+                    memory_type="note",
+                )
+                await storage.primary.store(shared)
+                storage.secondary.stored_memories[shared.content_hash] = shared
+                cloud_only = Memory(
+                    content="cloud-only",
+                    content_hash=generate_content_hash("cloud-only"),
+                    tags=["cloud"],
+                    memory_type="note",
+                )
+                storage.secondary.stored_memories[cloud_only.content_hash] = cloud_only
+                storage.secondary.stored_memories[generate_content_hash("another")] = Memory(
+                    content="another",
+                    content_hash=generate_content_hash("another"),
+                    tags=["cloud"],
+                    memory_type="note",
+                )
+
+                result = await storage.force_pull_sync()
+
+                assert result["success"] is True
+                assert result["memories_pulled"] == 2
+                assert storage.secondary.cursor_scan_calls > 0
+                assert cloud_only.content_hash in await storage.primary.get_all_content_hashes()
+            finally:
+                await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_pull_sync_skips_semantic_dedup(self, temp_sqlite_db, mock_cloudflare_config):
+        """A memory pulled from the secondary was already deduplicated when it was first
+        written, so the receiving device must not run semantic dedup on it again. With
+        dedup on, a pulled memory that is close to something the primary already holds
+        was rejected ("Duplicate content detected") and never arrived, on every sync."""
+
+        class PullMockCloudflareStorage(MockCloudflareStorage):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.base_url = "https://mock"
+                self.d1_database_id = "mock-db"
+
+            async def get_by_hash(self, content_hash):
+                return self.stored_memories.get(content_hash)
+
+            async def _retry_request(self, method, url, **kwargs):
+                params = kwargs.get("json", {}).get("params", [])
+                last_id = params[0] if params else 0
+                resp = Mock()
+                rows = [
+                    {"id": i, "content_hash": h}
+                    for i, h in enumerate(self.stored_memories, start=1)
+                ] if last_id == 0 else []
+                resp.json = Mock(return_value={"success": True, "result": [{"results": rows}]})
+                return resp
+
+        def make(content):
+            return Memory(content=content, content_hash=generate_content_hash(content),
+                          tags=["t"], memory_type="note")
+
+        original = make("Claude Code is a powerful CLI tool for software engineering.")
+        near_dup = make("The Claude Code CLI is an excellent software development tool.")
+        local_only = make("Totally unrelated: the quarterly invoice is due on Friday.")
+
+        # No automatic pull at startup: the only pull in this test is the explicit one below.
+        with patch('mcp_memory_service.storage.hybrid.HYBRID_SYNC_ON_STARTUP', False), \
+                patch('mcp_memory_service.storage.hybrid.CloudflareStorage', PullMockCloudflareStorage):
+            storage = HybridMemoryStorage(
+                sqlite_db_path=temp_sqlite_db,
+                embedding_model="all-MiniLM-L6-v2",
+                cloudflare_config=mock_cloudflare_config,
+                sync_interval=1,
+                batch_size=5,
+            )
+            await storage.initialize()
+            try:
+                # Semantic dedup is on for the primary (tests/conftest.py turns it off by
+                # default). Which memories count as similar is the input of this test, not the
+                # logic under test, so it is fixed here instead of depending on an embedding
+                # model being installed: the near-duplicate is always judged similar.
+                storage.primary.semantic_dedup_enabled = True
+
+                async def judge_similarity(content, **kwargs):
+                    if content == near_dup.content:
+                        return True, original.content_hash
+                    return False, None
+
+                storage.primary._check_semantic_duplicate = judge_similarity
+
+                # Primary holds the original plus a local-only memory (so local >= cloud
+                # and the hash-diff pull runs); the near-duplicate exists only in the cloud.
+                for memory in (original, local_only):
+                    ok, msg = await storage.primary.store(memory)
+                    assert ok, msg
+                for memory in (original, near_dup):
+                    storage.secondary.stored_memories[memory.content_hash] = memory
+
+                # A normal store of the near-duplicate is rejected, so dedup is in effect.
+                ok, msg = await storage.primary.store(near_dup)
+                assert not ok and "semantically similar" in msg
+
+                result = await storage.force_pull_sync()
+                assert result["success"] is True
+
+                local_hashes = await storage.primary.get_all_content_hashes()
+                assert near_dup.content_hash in local_hashes, (
+                    "pulled memory was rejected by semantic dedup on the receiving device"
                 )
             finally:
                 await storage.close()
